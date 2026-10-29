@@ -41,24 +41,32 @@
             C46,30 45,28 43,27
             Z" />
 
-    <circle
+    <!-- Mesh nodes -->
+    <path
         android:fillColor="#55D66A"
-        android:cx="18"
-        android:cy="91"
-        android:radius="6" />
+        android:pathData="M12,91
+            C12,87.686 14.686,85 18,85
+            C21.314,85 24,87.686 24,91
+            C24,94.314 21.314,97 18,97
+            C14.686,97 12,94.314 12,91 Z" />
 
-    <circle
+    <path
         android:fillColor="#55D66A"
-        android:cx="90"
-        android:cy="91"
-        android:radius="6" />
+        android:pathData="M84,91
+            C84,87.686 86.686,85 90,85
+            C93.314,85 96,87.686 96,91
+            C96,94.314 93.314,97 90,97
+            C86.686,97 84,94.314 84,91 Z" />
 
-    <circle
+    <path
         android:fillColor="#55D66A"
-        android:cx="54"
-        android:cy="96"
-        android:radius="6" />
+        android:pathData="M48,96
+            C48,92.686 50.686,90 54,90
+            C57.314,90 60,92.686 60,96
+            C60,99.314 57.314,102 54,102
+            C50.686,102 48,99.314 48,96 Z" />
 
+    <!-- Mesh connections -->
     <path
         android:strokeColor="#55D66A"
         android:strokeWidth="3"
