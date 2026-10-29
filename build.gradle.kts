@@ -55,4 +55,6 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
 
     implementation("io.coil-kt:coil-compose:2.7.0")
+
+    implementation("com.google.android.gms:play-services-nearby:19.3.0")
 }
