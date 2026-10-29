@@ -16,13 +16,11 @@ android {
     }
 
     sourceSets {
-        getByName("main") {
-            manifest.srcFile("AndroidManifest.xml")
-            java.srcDirs(".")
-            res.srcDirs("res")
-        }
+    getByName("main") {
+        manifest.srcFile("AndroidManifest.xml")
+        res.srcDirs("res")
     }
-
+}
     buildTypes {
         release {
             isMinifyEnabled = false
