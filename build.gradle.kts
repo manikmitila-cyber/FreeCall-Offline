@@ -1,24 +1,46 @@
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.compose")
+    id("com.android.application") version "8.7.3"
+    id("org.jetbrains.kotlin.android") version "2.0.21"
 }
 
 android {
-    namespace = "com.meshmobile"
-    compileSdk = 35
+    namespace = "com.example.freecalloffline"
+    compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.meshmobile"
-        minSdk = 26
-        targetSdk = 35
+        applicationId = "com.example.freecalloffline"
+        minSdk = 24
+        targetSdk = 34
         versionCode = 1
-        versionName = "0.1"
+        versionName = "1.0"
+    }
+
+    sourceSets {
+        getByName("main") {
+            manifest.srcFile("AndroidManifest.xml")
+            java.srcDirs(".")
+            res.srcDirs("res")
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
     }
 }
 
 dependencies {
-    implementation("androidx.activity:activity-compose:1.10.1")
-    implementation("androidx.compose.material3:material3:1.3.1")
-    implementation("io.coil-kt:coil-compose:2.7.0")
-}
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.google.android.material:material:1.12.0")
+    implementation("androidx.constraintla
