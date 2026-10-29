@@ -18,14 +18,7 @@ android {
     sourceSets {
         getByName("main") {
             manifest.srcFile("AndroidManifest.xml")
-
             java.srcDirs(".")
-            java.exclude(
-                "build/**",
-                ".gradle/**",
-                ".github/**"
-            )
-
             res.srcDirs("res")
         }
     }
