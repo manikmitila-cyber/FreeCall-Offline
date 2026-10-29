@@ -101,7 +101,7 @@ fun FreeCallOfflineApp(context: Context) {
         rememberLauncherForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
         ) { result ->
-            if (result.values.all { it }) nearby?.start()
+            nearby?.start()
         }
 
     LaunchedEffect(nearby) {

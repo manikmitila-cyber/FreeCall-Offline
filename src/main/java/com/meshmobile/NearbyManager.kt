@@ -12,6 +12,7 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.AdvertisingOptions
 import com.google.android.gms.nearby.connection.ConnectionInfo
@@ -62,6 +63,11 @@ class NearbyManager(context: Context, private val displayName: String) {
     private val _callPeerId = MutableStateFlow<String?>(null)
     val callPeerId: StateFlow<String?> = _callPeerId
 
+    private val _status = MutableStateFlow("Starting…")
+    val status: StateFlow<String> = _status
+    private var advStatus = "starting"
+    private var discStatus = "starting"
+
     @Volatile private var audioRunning = false
     @Volatile var muted = false
     private var playInput: InputStream? = null
@@ -70,15 +76,33 @@ class NearbyManager(context: Context, private val displayName: String) {
     // ---------- lifecycle ----------
 
     fun start() {
+        advStatus = "starting"
+        discStatus = "starting"
+        publishStatus()
+
         client.startAdvertising(
             "$displayName|$myUid", SERVICE_ID, connectionCallback,
             AdvertisingOptions.Builder().setStrategy(STRATEGY).build()
-        ).addOnFailureListener { Log.w(TAG, "advertising failed", it) }
+        ).addOnSuccessListener {
+            advStatus = "ON"
+            publishStatus()
+        }.addOnFailureListener {
+            Log.w(TAG, "advertising failed", it)
+            advStatus = if (codeOf(it) == ConnectionsStatusCodes.STATUS_ALREADY_ADVERTISING) "ON" else "FAILED " + describe(it)
+            publishStatus()
+        }
 
         client.startDiscovery(
             SERVICE_ID, discoveryCallback,
             DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
-        ).addOnFailureListener { Log.w(TAG, "discovery failed", it) }
+        ).addOnSuccessListener {
+            discStatus = "ON"
+            publishStatus()
+        }.addOnFailureListener {
+            Log.w(TAG, "discovery failed", it)
+            discStatus = if (codeOf(it) == ConnectionsStatusCodes.STATUS_ALREADY_DISCOVERING) "ON" else "FAILED " + describe(it)
+            publishStatus()
+        }
     }
 
     fun stop() {
@@ -309,6 +333,17 @@ class NearbyManager(context: Context, private val displayName: String) {
         client.sendPayload(peerId, Payload.fromBytes(text.toByteArray(Charsets.UTF_8)))
     }
 
+    private fun publishStatus() {
+        _status.value = "Advertising: $advStatus\nDiscovery: $discStatus"
+    }
+
+    private fun codeOf(e: Exception): Int? = (e as? ApiException)?.statusCode
+
+    private fun describe(e: Exception): String {
+        val c = codeOf(e) ?: return e.message ?: "unknown error"
+        return "$c ${ConnectionsStatusCodes.getStatusCodeString(c)}"
+    }
+
     private fun publishPeers() {
         _peers.value = peerMap.values.sortedBy { it.name.lowercase() }
     }
@@ -326,13 +361,15 @@ class NearbyManager(context: Context, private val displayName: String) {
         private const val FRAME = 640 // 20 ms of 16 kHz mono PCM16
 
         fun requiredPermissions(): Array<String> {
-            val p = mutableListOf(Manifest.permission.RECORD_AUDIO)
+            val p = mutableListOf(
+                Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            )
             if (Build.VERSION.SDK_INT >= 31) {
                 p += Manifest.permission.BLUETOOTH_SCAN
                 p += Manifest.permission.BLUETOOTH_ADVERTISE
                 p += Manifest.permission.BLUETOOTH_CONNECT
             }
-            if (Build.VERSION.SDK_INT <= 32) p += Manifest.permission.ACCESS_FINE_LOCATION
             if (Build.VERSION.SDK_INT >= 33) p += Manifest.permission.NEARBY_WIFI_DEVICES
             return p.toTypedArray()
         }

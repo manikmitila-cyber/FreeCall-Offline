@@ -10,6 +10,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -28,6 +29,7 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun OfflineHome(nearby: NearbyManager) {
     val peers by nearby.peers.collectAsState()
+    val status by nearby.status.collectAsState()
     val callState by nearby.callState.collectAsState()
     val callPeerId by nearby.callPeerId.collectAsState()
     var openId by remember { mutableStateOf<String?>(null) }
@@ -40,6 +42,7 @@ fun OfflineHome(nearby: NearbyManager) {
     } else {
         Column(Modifier.fillMaxSize().padding(16.dp)) {
             Text("Nearby / Mesh users")
+            Text(status, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
             if (peers.isEmpty()) Text("Searching for nearby phones…", Modifier.padding(top = 12.dp))
             LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(top = 12.dp)) {
                 items(peers, key = { it.endpointId }) { p ->
