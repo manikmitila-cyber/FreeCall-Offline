@@ -94,7 +94,7 @@ fun FreeCallOfflineApp(context: Context) {
         }
 
     val nearby = remember(saved) {
-        if (saved) NearbyManager(context, name.ifBlank { username }) else null
+        if (saved) NearbyManager(context, name.ifBlank { username }, username) else null
     }
 
     val permLauncher =

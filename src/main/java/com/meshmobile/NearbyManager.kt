@@ -9,7 +9,11 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.Ringtone
+import android.media.RingtoneManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.google.android.gms.common.api.ApiException
@@ -29,13 +33,29 @@ import com.google.android.gms.nearby.connection.Strategy
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.InputStream
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
 
-data class Peer(val endpointId: String, val name: String, val uid: String, val connected: Boolean)
-data class ChatMessage(val peerId: String, val text: String, val mine: Boolean, val time: Long = System.currentTimeMillis())
+data class Peer(
+    val endpointId: String,
+    val name: String,
+    val username: String,
+    val uid: String,
+    val connected: Boolean
+)
+
+/** peerUid is the peer's stable id (survives app restarts), not the session endpoint id. */
+data class ChatMessage(
+    val peerUid: String,
+    val text: String,
+    val mine: Boolean,
+    val time: Long = System.currentTimeMillis()
+)
+
 enum class CallState { IDLE, OUTGOING, INCOMING, ACTIVE }
 
 /**
@@ -45,23 +65,43 @@ enum class CallState { IDLE, OUTGOING, INCOMING, ACTIVE }
  * Protocol (BYTES payloads): "M|<text>" message, "CR" call request,
  * "CA" call accepted, "CX" call rejected/ended. Voice = STREAM payload of 16 kHz mono PCM16.
  */
-class NearbyManager(context: Context, private val displayName: String) {
+class NearbyManager(
+    context: Context,
+    private val displayName: String,
+    private val username: String
+) {
 
     private val app = context.applicationContext
     private val client = Nearby.getConnectionsClient(app)
-    private val myUid = UUID.randomUUID().toString().take(8)
+    private val prefs = app.getSharedPreferences("freecall_nearby", Context.MODE_PRIVATE)
+    private val handler = Handler(Looper.getMainLooper())
+
+    /** Stable id for this phone, created once and kept. */
+    private val myUid: String = prefs.getString("uid", null)
+        ?: UUID.randomUUID().toString().take(8).also { prefs.edit().putString("uid", it).apply() }
 
     private val peerMap = ConcurrentHashMap<String, Peer>()
     private val _peers = MutableStateFlow<List<Peer>>(emptyList())
     val peers: StateFlow<List<Peer>> = _peers
 
-    private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
+    private val _messages = MutableStateFlow(loadMessages())
     val messages: StateFlow<List<ChatMessage>> = _messages
+
+    /** Unread message count per peer uid. */
+    private val _unread = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val unread: StateFlow<Map<String, Int>> = _unread
+    @Volatile private var activeChatUid: String? = null
 
     private val _callState = MutableStateFlow(CallState.IDLE)
     val callState: StateFlow<CallState> = _callState
     private val _callPeerId = MutableStateFlow<String?>(null)
     val callPeerId: StateFlow<String?> = _callPeerId
+    private val _callStart = MutableStateFlow(0L)
+    val callStartTime: StateFlow<Long> = _callStart
+    private val _muted = MutableStateFlow(false)
+    val muted: StateFlow<Boolean> = _muted
+    private val _speaker = MutableStateFlow(true)
+    val speaker: StateFlow<Boolean> = _speaker
 
     private val _status = MutableStateFlow("Starting…")
     val status: StateFlow<String> = _status
@@ -69,9 +109,11 @@ class NearbyManager(context: Context, private val displayName: String) {
     private var discStatus = "starting"
 
     @Volatile private var audioRunning = false
-    @Volatile var muted = false
     private var playInput: InputStream? = null
     private var savedAudioMode = AudioManager.MODE_NORMAL
+    private var ringtone: Ringtone? = null
+
+    private val advertisedName: String get() = "$displayName|$username|$myUid"
 
     // ---------- lifecycle ----------
 
@@ -81,7 +123,7 @@ class NearbyManager(context: Context, private val displayName: String) {
         publishStatus()
 
         client.startAdvertising(
-            "$displayName|$myUid", SERVICE_ID, connectionCallback,
+            advertisedName, SERVICE_ID, connectionCallback,
             AdvertisingOptions.Builder().setStrategy(STRATEGY).build()
         ).addOnSuccessListener {
             advStatus = "ON"
@@ -106,6 +148,7 @@ class NearbyManager(context: Context, private val displayName: String) {
     }
 
     fun stop() {
+        handler.removeCallbacksAndMessages(null)
         endCall()
         client.stopAdvertising()
         client.stopDiscovery()
@@ -116,16 +159,53 @@ class NearbyManager(context: Context, private val displayName: String) {
 
     /** Retry connecting to a peer that is visible but not connected. */
     fun connect(peerId: String) {
-        client.requestConnection("$displayName|$myUid", peerId, connectionCallback)
+        client.requestConnection(advertisedName, peerId, connectionCallback)
             .addOnFailureListener { Log.w(TAG, "connect failed", it) }
     }
 
     // ---------- messages ----------
 
+    fun setActiveChat(uid: String?) {
+        activeChatUid = uid
+        if (uid != null) _unread.update { it - uid }
+    }
+
     fun sendMessage(peerId: String, text: String) {
         if (text.isBlank()) return
         send(peerId, "M|$text")
-        _messages.update { it + ChatMessage(peerId, text, mine = true) }
+        val uid = peerMap[peerId]?.uid ?: peerId
+        addMessage(ChatMessage(uid, text, mine = true))
+    }
+
+    private fun addMessage(m: ChatMessage) {
+        _messages.update { (it + m).takeLast(MAX_MESSAGES) }
+        saveMessages(_messages.value)
+    }
+
+    private fun saveMessages(list: List<ChatMessage>) {
+        val arr = JSONArray()
+        list.forEach { m ->
+            arr.put(
+                JSONObject()
+                    .put("p", m.peerUid)
+                    .put("t", m.text)
+                    .put("m", m.mine)
+                    .put("ts", m.time)
+            )
+        }
+        prefs.edit().putString("messages", arr.toString()).apply()
+    }
+
+    private fun loadMessages(): List<ChatMessage> {
+        return try {
+            val arr = JSONArray(prefs.getString("messages", "[]"))
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                ChatMessage(o.getString("p"), o.getString("t"), o.getBoolean("m"), o.getLong("ts"))
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
     }
 
     // ---------- calls ----------
@@ -140,7 +220,9 @@ class NearbyManager(context: Context, private val displayName: String) {
     fun acceptCall() {
         val p = _callPeerId.value ?: return
         if (_callState.value != CallState.INCOMING) return
+        stopRinging()
         send(p, "CA")
+        _callStart.value = System.currentTimeMillis()
         _callState.value = CallState.ACTIVE
         startAudio(p)
     }
@@ -153,6 +235,16 @@ class NearbyManager(context: Context, private val displayName: String) {
         teardownCall()
     }
 
+    fun toggleMute() {
+        _muted.value = !_muted.value
+    }
+
+    fun toggleSpeaker() {
+        val on = !_speaker.value
+        _speaker.value = on
+        setSpeaker(on)
+    }
+
     fun setSpeaker(on: Boolean) {
         (app.getSystemService(Context.AUDIO_SERVICE) as AudioManager).isSpeakerphoneOn = on
     }
@@ -161,9 +253,9 @@ class NearbyManager(context: Context, private val displayName: String) {
 
     private val discoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(id: String, info: DiscoveredEndpointInfo) {
-            val (name, uid) = parseName(info.endpointName)
+            val (name, user, uid) = parseName(info.endpointName)
             if (uid == myUid) return
-            peerMap[id] = Peer(id, name, uid, connected = false)
+            peerMap[id] = Peer(id, name, user, uid, connected = false)
             publishPeers()
             // Only one side initiates, to avoid both phones requesting at once.
             if (myUid < uid) connect(id)
@@ -180,8 +272,8 @@ class NearbyManager(context: Context, private val displayName: String) {
 
     private val connectionCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(id: String, info: ConnectionInfo) {
-            val (name, uid) = parseName(info.endpointName)
-            peerMap[id] = Peer(id, name, uid, connected = false)
+            val (name, user, uid) = parseName(info.endpointName)
+            peerMap[id] = Peer(id, name, user, uid, connected = false)
             publishPeers()
             // NOTE: auto-accepts. For production, show info.authenticationDigits and ask the user.
             client.acceptConnection(id, payloadCallback)
@@ -194,9 +286,16 @@ class NearbyManager(context: Context, private val displayName: String) {
         }
 
         override fun onDisconnected(id: String) {
-            peerMap[id]?.let { peerMap[id] = it.copy(connected = false) }
+            val p = peerMap[id]
+            if (p != null) peerMap[id] = p.copy(connected = false)
             publishPeers()
             if (_callPeerId.value == id) teardownCall()
+            // Auto-reconnect: the side with the smaller uid retries once after a short wait.
+            if (p != null && myUid < p.uid) {
+                handler.postDelayed({
+                    if (peerMap[id]?.connected == false) connect(id)
+                }, 3000)
+            }
         }
     }
 
@@ -221,22 +320,54 @@ class NearbyManager(context: Context, private val displayName: String) {
 
     private fun onControl(from: String, s: String) {
         when {
-            s.startsWith("M|") ->
-                _messages.update { it + ChatMessage(from, s.substring(2), mine = false) }
+            s.startsWith("M|") -> {
+                val uid = peerMap[from]?.uid ?: from
+                addMessage(ChatMessage(uid, s.substring(2), mine = false))
+                if (activeChatUid != uid) {
+                    _unread.update { it + (uid to ((it[uid] ?: 0) + 1)) }
+                    beep()
+                }
+            }
 
             s == "CR" ->
                 if (_callState.value == CallState.IDLE) {
                     _callPeerId.value = from
                     _callState.value = CallState.INCOMING
+                    startRinging()
                 } else send(from, "CX")
 
             s == "CA" ->
                 if (_callState.value == CallState.OUTGOING && _callPeerId.value == from) {
+                    _callStart.value = System.currentTimeMillis()
                     _callState.value = CallState.ACTIVE
                     startAudio(from)
                 }
 
             s == "CX" -> if (_callPeerId.value == from) teardownCall()
+        }
+    }
+
+    // ---------- ringtone / sound ----------
+
+    private fun startRinging() {
+        runCatching {
+            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+            ringtone = RingtoneManager.getRingtone(app, uri)?.also {
+                if (Build.VERSION.SDK_INT >= 28) it.isLooping = true
+                it.play()
+            }
+        }
+    }
+
+    private fun stopRinging() {
+        runCatching { ringtone?.stop() }
+        ringtone = null
+    }
+
+    private fun beep() {
+        runCatching {
+            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            RingtoneManager.getRingtone(app, uri)?.play()
         }
     }
 
@@ -248,6 +379,7 @@ class NearbyManager(context: Context, private val displayName: String) {
         val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         savedAudioMode = am.mode
         am.mode = AudioManager.MODE_IN_COMMUNICATION
+        _speaker.value = true
         am.isSpeakerphoneOn = true
 
         val pipe = ParcelFileDescriptor.createPipe()
@@ -266,7 +398,7 @@ class NearbyManager(context: Context, private val displayName: String) {
                 while (audioRunning) {
                     val n = rec.read(buf, 0, buf.size)
                     if (n <= 0) continue
-                    if (muted) buf.fill(0)
+                    if (_muted.value) buf.fill(0)
                     out.write(buf, 0, n)
                 }
             } catch (e: Exception) {
@@ -317,9 +449,13 @@ class NearbyManager(context: Context, private val displayName: String) {
     }
 
     private fun teardownCall() {
+        stopRinging()
         audioRunning = false
         _callState.value = CallState.IDLE
         _callPeerId.value = null
+        _callStart.value = 0L
+        _muted.value = false
+        _speaker.value = true
         runCatching { playInput?.close() }
         playInput = null
         val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -348,9 +484,14 @@ class NearbyManager(context: Context, private val displayName: String) {
         _peers.value = peerMap.values.sortedBy { it.name.lowercase() }
     }
 
-    private fun parseName(raw: String): Pair<String, String> {
-        val i = raw.lastIndexOf('|')
-        return if (i < 0) raw to raw else raw.substring(0, i) to raw.substring(i + 1)
+    /** Advertised name format: "<display name>|<username>|<uid>". Returns (name, username, uid). */
+    private fun parseName(raw: String): Triple<String, String, String> {
+        val parts = raw.split('|')
+        return when {
+            parts.size >= 3 -> Triple(parts.dropLast(2).joinToString("|"), parts[parts.size - 2], parts.last())
+            parts.size == 2 -> Triple(parts[0], "", parts[1])
+            else -> Triple(raw, "", raw)
+        }
     }
 
     companion object {
@@ -359,6 +500,7 @@ class NearbyManager(context: Context, private val displayName: String) {
         private val STRATEGY = Strategy.P2P_CLUSTER
         private const val RATE = 16000
         private const val FRAME = 640 // 20 ms of 16 kHz mono PCM16
+        private const val MAX_MESSAGES = 500
 
         fun requiredPermissions(): Array<String> {
             val p = mutableListOf(
