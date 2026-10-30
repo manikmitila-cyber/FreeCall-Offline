@@ -43,6 +43,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -153,19 +155,39 @@ private fun HomeTabs(
     val total = unread.values.sum()
 
     Column(Modifier.fillMaxSize()) {
-        TabRow(selectedTabIndex = tab) {
-            Tab(
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            when (tab) {
+                0 -> NearbyTab(nearby, peers, unread, onOpen)
+                1 -> CallsTab(nearby)
+                2 -> DialTab(nearby)
+                else -> SettingsTab(nearby)
+            }
+        }
+        NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceVariant) {
+            NavigationBarItem(
                 selected = tab == 0,
                 onClick = { onTab(0) },
-                text = { Text(if (total > 0) "Nearby ($total)" else "Nearby") }
+                icon = { Text("📡", fontSize = 20.sp) },
+                label = { Text(if (total > 0) "Nearby ($total)" else "Nearby") }
             )
-            Tab(selected = tab == 1, onClick = { onTab(1) }, text = { Text("Calls") })
-            Tab(selected = tab == 2, onClick = { onTab(2) }, text = { Text("Settings") })
-        }
-        when (tab) {
-            0 -> NearbyTab(nearby, peers, unread, onOpen)
-            1 -> CallsTab(nearby)
-            else -> SettingsTab(nearby)
+            NavigationBarItem(
+                selected = tab == 1,
+                onClick = { onTab(1) },
+                icon = { Text("📞", fontSize = 20.sp) },
+                label = { Text("Calls") }
+            )
+            NavigationBarItem(
+                selected = tab == 2,
+                onClick = { onTab(2) },
+                icon = { Text("⌨️", fontSize = 20.sp) },
+                label = { Text("Dial") }
+            )
+            NavigationBarItem(
+                selected = tab == 3,
+                onClick = { onTab(3) },
+                icon = { Text("⚙️", fontSize = 20.sp) },
+                label = { Text("Settings") }
+            )
         }
     }
 }

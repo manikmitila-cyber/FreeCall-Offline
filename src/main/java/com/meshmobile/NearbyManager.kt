@@ -42,6 +42,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
 
@@ -50,7 +51,8 @@ data class Peer(
     val name: String,
     val username: String,
     val uid: String,
-    val connected: Boolean
+    val connected: Boolean,
+    val phone: String = ""
 )
 
 /** peerUid is the peer's stable id (survives app restarts), not the session endpoint id. */
@@ -72,6 +74,8 @@ data class CallRecord(
     val seconds: Long
 )
 
+data class Ident(val name: String, val user: String, val phone: String, val uid: String)
+
 enum class CallState { IDLE, OUTGOING, INCOMING, ACTIVE }
 
 /**
@@ -84,13 +88,17 @@ enum class CallState { IDLE, OUTGOING, INCOMING, ACTIVE }
 class NearbyManager(
     context: Context,
     private val displayName: String,
-    private val username: String
+    private val username: String,
+    private val phone: String = ""
 ) {
 
     private val app = context.applicationContext
     private val client = Nearby.getConnectionsClient(app)
     private val prefs = app.getSharedPreferences("freecall_nearby", Context.MODE_PRIVATE)
     private val handler = Handler(Looper.getMainLooper())
+
+    /** Called for new incoming messages and calls (used for notifications). */
+    var onIncoming: ((String, String) -> Unit)? = null
 
     /** Stable id for this phone, created once and kept. */
     private val myUid: String = prefs.getString("uid", null)
@@ -146,7 +154,7 @@ class NearbyManager(
     private var savedAudioMode = AudioManager.MODE_NORMAL
     private var ringtone: Ringtone? = null
 
-    private val advertisedName: String get() = "$displayName|$username|$myUid"
+    private val advertisedName: String get() = "$displayName|$username|$phone|$myUid"
 
     // ---------- lifecycle ----------
 
@@ -312,6 +320,10 @@ class NearbyManager(
     private fun addMessage(m: ChatMessage) {
         _messages.update { (it + m).takeLast(MAX_MESSAGES) }
         saveMessages(_messages.value)
+        if (!m.mine) {
+            val who = peerMap.values.firstOrNull { it.uid == m.peerUid }?.name ?: "FreeCall"
+            onIncoming?.invoke(who, if (m.imagePath != null) "📷 Photo" else m.text)
+        }
     }
 
     private fun saveMessages(list: List<ChatMessage>) {
@@ -441,12 +453,13 @@ class NearbyManager(
 
     private val discoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(id: String, info: DiscoveredEndpointInfo) {
-            val (name, user, uid) = parseName(info.endpointName)
+            val (name, user, phone, uid) = parseName(info.endpointName)
             if (uid == myUid) return
-            peerMap[id] = Peer(id, name, user, uid, connected = false)
+            peerMap[id] = Peer(id, name, user, uid, connected = false, phone = phone)
             publishPeers()
             // Only one side initiates, to avoid both phones requesting at once.
             if (myUid < uid) connect(id)
+            else handler.postDelayed({ if (peerMap[id]?.connected == false) connect(id) }, 8000)
         }
 
         override fun onEndpointLost(id: String) {
@@ -460,8 +473,8 @@ class NearbyManager(
 
     private val connectionCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(id: String, info: ConnectionInfo) {
-            val (name, user, uid) = parseName(info.endpointName)
-            peerMap[id] = Peer(id, name, user, uid, connected = false)
+            val (name, user, phone, uid) = parseName(info.endpointName)
+            peerMap[id] = Peer(id, name, user, uid, connected = false, phone = phone)
             publishPeers()
             // NOTE: auto-accepts. For production, show info.authenticationDigits and ask the user.
             client.acceptConnection(id, payloadCallback)
@@ -490,13 +503,14 @@ class NearbyManager(
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(id: String, payload: Payload) {
             when (payload.type) {
-                Payload.Type.BYTES -> payload.asBytes()?.let { onControl(id, String(it, Charsets.UTF_8)) }
-                Payload.Type.STREAM -> {
-                    val input = payload.asStream()?.asInputStream() ?: return
-                    if (_callState.value == CallState.IDLE || _callPeerId.value != id) {
-                        runCatching { input.close() }
+                Payload.Type.BYTES -> payload.asBytes()?.let { b ->
+                    if (b.isNotEmpty() && b[0] == VOICE_TAG) {
+                        if (_callState.value == CallState.ACTIVE && _callPeerId.value == id) {
+                            voiceQueue.offer(b.copyOfRange(1, b.size))
+                            while (voiceQueue.size > MAX_QUEUE) voiceQueue.poll()
+                        }
                     } else {
-                        startPlayback(input)
+                        onControl(id, String(b, Charsets.UTF_8))
                     }
                 }
                 Payload.Type.FILE -> incomingFiles[payload.id] = id to payload
@@ -545,6 +559,7 @@ class NearbyManager(
                     callPeerName = peerMap[from]?.name ?: "Unknown"
                     _callState.value = CallState.INCOMING
                     startRinging()
+                    onIncoming?.invoke(callPeerName, "📞 Incoming call")
                 } else send(from, "CX")
 
             s == "CA" ->
@@ -586,6 +601,13 @@ class NearbyManager(
 
     // ---------- audio ----------
 
+    private val voiceQueue = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+
+    /**
+     * Voice goes as small BYTES packets (20 ms each), not a STREAM. Packets are sent
+     * immediately, and playback keeps only about 40-80 ms of audio buffered, so talk
+     * stays close to real time.
+     */
     @SuppressLint("MissingPermission")
     private fun startAudio(peerId: String) {
         audioRunning = true
@@ -594,39 +616,34 @@ class NearbyManager(
         am.mode = AudioManager.MODE_IN_COMMUNICATION
         _speaker.value = true
         am.isSpeakerphoneOn = true
-
-        val pipe = ParcelFileDescriptor.createPipe()
-        client.sendPayload(peerId, Payload.fromStream(pipe[0]))
-        val out = ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])
+        voiceQueue.clear()
 
         thread(name = "fc-capture") {
             val min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
             val rec = AudioRecord(
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION, RATE,
-                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, FRAME * 4)
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, FRAME * 2)
             )
-            val buf = ByteArray(FRAME)
+            val pcm = ByteArray(FRAME)
+            val packet = ByteArray(FRAME + 1)
+            packet[0] = VOICE_TAG
             try {
                 rec.startRecording()
                 while (audioRunning) {
-                    val n = rec.read(buf, 0, buf.size)
+                    val n = rec.read(pcm, 0, pcm.size)
                     if (n <= 0) continue
-                    if (_muted.value) buf.fill(0)
-                    out.write(buf, 0, n)
+                    if (_muted.value) java.util.Arrays.fill(pcm, 0.toByte())
+                    System.arraycopy(pcm, 0, packet, 1, n)
+                    client.sendPayload(peerId, Payload.fromBytes(packet.copyOf(n + 1)))
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "capture stopped", e)
             } finally {
                 runCatching { rec.stop() }
                 rec.release()
-                runCatching { out.close() }
             }
         }
-    }
 
-    private fun startPlayback(input: InputStream) {
-        runCatching { playInput?.close() }
-        playInput = input
         thread(name = "fc-play") {
             val min = AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
             val track = AudioTrack.Builder()
@@ -640,17 +657,20 @@ class NearbyManager(
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build()
                 )
-                .setBufferSizeInBytes(maxOf(min, FRAME * 4))
+                .setBufferSizeInBytes(maxOf(min, FRAME * 2))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                 .build()
-            val buf = ByteArray(FRAME)
             try {
                 track.play()
-                while (_callState.value != CallState.IDLE) {
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    if (n > 0) track.write(buf, 0, n)
+                var primed = false
+                while (audioRunning) {
+                    if (!primed) {
+                        if (voiceQueue.size >= PREBUFFER) primed = true else { Thread.sleep(10); continue }
+                    }
+                    val chunk = voiceQueue.poll(100, TimeUnit.MILLISECONDS)
+                    if (chunk == null) { primed = false; continue }
+                    track.write(chunk, 0, chunk.size)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "playback stopped", e)
@@ -670,8 +690,7 @@ class NearbyManager(
         _callStart.value = 0L
         _muted.value = false
         _speaker.value = true
-        runCatching { playInput?.close() }
-        playInput = null
+        voiceQueue.clear()
         val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         am.mode = savedAudioMode
         am.isSpeakerphoneOn = false
@@ -698,14 +717,17 @@ class NearbyManager(
         _peers.value = peerMap.values.sortedBy { it.name.lowercase() }
     }
 
-    /** Advertised name format: "<display name>|<username>|<uid>". Returns (name, username, uid). */
-    private fun parseName(raw: String): Triple<String, String, String> {
+    /** Advertised name: "<name>|<username>|<phone>|<uid>". The name may contain '|', so split from the right. */
+    private fun parseName(raw: String): Ident {
         val parts = raw.split('|')
-        return when {
-            parts.size >= 3 -> Triple(parts.dropLast(2).joinToString("|"), parts[parts.size - 2], parts.last())
-            parts.size == 2 -> Triple(parts[0], "", parts[1])
-            else -> Triple(raw, "", raw)
-        }
+        return if (parts.size >= 4) {
+            Ident(
+                parts.subList(0, parts.size - 3).joinToString("|"),
+                parts[parts.size - 3],
+                parts[parts.size - 2],
+                parts.last()
+            )
+        } else Ident(raw, "", "", raw)
     }
 
     companion object {
@@ -715,6 +737,9 @@ class NearbyManager(
         private const val RATE = 16000
         private const val FRAME = 640 // 20 ms of 16 kHz mono PCM16
         private const val MAX_MESSAGES = 500
+        private const val VOICE_TAG: Byte = 1
+        private const val MAX_QUEUE = 4
+        private const val PREBUFFER = 2
 
         fun requiredPermissions(): Array<String> {
             val p = mutableListOf(
@@ -728,6 +753,7 @@ class NearbyManager(
                 p += Manifest.permission.BLUETOOTH_CONNECT
             }
             if (Build.VERSION.SDK_INT >= 33) p += Manifest.permission.NEARBY_WIFI_DEVICES
+            if (Build.VERSION.SDK_INT >= 33) p += Manifest.permission.POST_NOTIFICATIONS
             return p.toTypedArray()
         }
     }

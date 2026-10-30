@@ -93,8 +93,8 @@ fun FreeCallOfflineApp(context: Context) {
                 .apply()
         }
 
-    val nearby = remember(saved) {
-        if (saved) NearbyManager(context, name.ifBlank { username }, username) else null
+    val nearby = remember(saved, name, username, phone) {
+        if (saved) MeshHub.get(context, name.ifBlank { username }, username, phone) else null
     }
 
     val permLauncher =
@@ -102,6 +102,7 @@ fun FreeCallOfflineApp(context: Context) {
             ActivityResultContracts.RequestMultiplePermissions()
         ) { result ->
             nearby?.start()
+            if (nearby != null) MeshService.start(context)
         }
 
     LaunchedEffect(nearby) {
@@ -110,9 +111,6 @@ fun FreeCallOfflineApp(context: Context) {
         }
     }
 
-    DisposableEffect(nearby) {
-        onDispose { nearby?.stop() }
-    }
 
     FreeCallTheme {
 
