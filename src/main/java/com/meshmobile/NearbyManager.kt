@@ -363,6 +363,7 @@ class NearbyManager(context: Context, private val displayName: String) {
         fun requiredPermissions(): Array<String> {
             val p = mutableListOf(
                 Manifest.permission.RECORD_AUDIO,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
                 Manifest.permission.ACCESS_FINE_LOCATION
             )
             if (Build.VERSION.SDK_INT >= 31) {
