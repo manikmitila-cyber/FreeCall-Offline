@@ -3,6 +3,8 @@ package com.meshmobile
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -11,6 +13,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.Ringtone
 import android.media.RingtoneManager
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -35,6 +38,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -53,7 +58,18 @@ data class ChatMessage(
     val peerUid: String,
     val text: String,
     val mine: Boolean,
-    val time: Long = System.currentTimeMillis()
+    val time: Long = System.currentTimeMillis(),
+    val id: String = UUID.randomUUID().toString().take(8),
+    val delivered: Boolean = false,
+    val imagePath: String? = null
+)
+
+data class CallRecord(
+    val peerName: String,
+    val outgoing: Boolean,
+    val answered: Boolean,
+    val time: Long,
+    val seconds: Long
 )
 
 enum class CallState { IDLE, OUTGOING, INCOMING, ACTIVE }
@@ -86,6 +102,14 @@ class NearbyManager(
 
     private val _messages = MutableStateFlow(loadMessages())
     val messages: StateFlow<List<ChatMessage>> = _messages
+
+    private val _calls = MutableStateFlow(loadCalls())
+    val calls: StateFlow<List<CallRecord>> = _calls
+
+    private val incomingFiles = ConcurrentHashMap<Long, Pair<String, Payload>>()
+    private var callOutgoing = false
+    private var callAnswered = false
+    private var callPeerName = ""
 
     /** Unread message count per peer uid. */
     private val _unread = MutableStateFlow<Map<String, Int>>(emptyMap())
@@ -172,9 +196,76 @@ class NearbyManager(
 
     fun sendMessage(peerId: String, text: String) {
         if (text.isBlank()) return
-        send(peerId, "M|$text")
         val uid = peerMap[peerId]?.uid ?: peerId
-        addMessage(ChatMessage(uid, text, mine = true))
+        val msg = ChatMessage(uid, text, mine = true)
+        send(peerId, "M|${msg.id}|$text")
+        addMessage(msg)
+    }
+
+    /** Send a photo (compressed to max 1280 px) to a connected peer. */
+    fun sendImage(peerId: String, uri: Uri) {
+        thread(name = "fc-img") {
+            try {
+                val file = prepareImage(uri) ?: return@thread
+                client.sendPayload(peerId, Payload.fromFile(file))
+                val uid = peerMap[peerId]?.uid ?: peerId
+                addMessage(ChatMessage(uid, "", mine = true, imagePath = file.absolutePath))
+            } catch (e: Exception) {
+                Log.w(TAG, "send image failed", e)
+            }
+        }
+    }
+
+    fun clearChat(uid: String) {
+        _messages.value.filter { it.peerUid == uid && it.imagePath != null }
+            .forEach { runCatching { File(it.imagePath!!).delete() } }
+        _messages.update { list -> list.filter { it.peerUid != uid } }
+        saveMessages(_messages.value)
+    }
+
+    private fun markDelivered(id: String) {
+        _messages.update { list -> list.map { if (it.id == id && it.mine) it.copy(delivered = true) else it } }
+        saveMessages(_messages.value)
+    }
+
+    private fun prepareImage(uri: Uri): File? {
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            app.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+            var sample = 1
+            while (bounds.outWidth / sample > 1280 || bounds.outHeight / sample > 1280) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bmp = app.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+                ?: return null
+            val dir = File(app.filesDir, "images").apply { mkdirs() }
+            val out = File(dir, "img_${System.currentTimeMillis()}.jpg")
+            FileOutputStream(out).use { bmp.compress(Bitmap.CompressFormat.JPEG, 75, it) }
+            out
+        } catch (e: Exception) {
+            Log.w(TAG, "prepare image failed", e)
+            null
+        }
+    }
+
+    private fun saveReceivedImage(from: String, payload: Payload) {
+        thread(name = "fc-img-rcv") {
+            try {
+                val pfd = payload.asFile()?.asParcelFileDescriptor() ?: return@thread
+                val dir = File(app.filesDir, "images").apply { mkdirs() }
+                val out = File(dir, "rcv_${System.currentTimeMillis()}.jpg")
+                ParcelFileDescriptor.AutoCloseInputStream(pfd).use { input ->
+                    FileOutputStream(out).use { input.copyTo(it) }
+                }
+                val uid = peerMap[from]?.uid ?: from
+                addMessage(ChatMessage(uid, "", mine = false, imagePath = out.absolutePath))
+                if (activeChatUid != uid) {
+                    _unread.update { it + (uid to ((it[uid] ?: 0) + 1)) }
+                    handler.post { beep() }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "receive image failed", e)
+            }
+        }
     }
 
     private fun addMessage(m: ChatMessage) {
@@ -191,6 +282,9 @@ class NearbyManager(
                     .put("t", m.text)
                     .put("m", m.mine)
                     .put("ts", m.time)
+                    .put("id", m.id)
+                    .put("d", m.delivered)
+                    .put("i", m.imagePath ?: "")
             )
         }
         prefs.edit().putString("messages", arr.toString()).apply()
@@ -201,7 +295,56 @@ class NearbyManager(
             val arr = JSONArray(prefs.getString("messages", "[]"))
             (0 until arr.length()).map { i ->
                 val o = arr.getJSONObject(i)
-                ChatMessage(o.getString("p"), o.getString("t"), o.getBoolean("m"), o.getLong("ts"))
+                val img = o.optString("i", "")
+                ChatMessage(
+                    peerUid = o.getString("p"),
+                    text = o.getString("t"),
+                    mine = o.getBoolean("m"),
+                    time = o.getLong("ts"),
+                    id = o.optString("id", o.getLong("ts").toString()),
+                    delivered = o.optBoolean("d", false),
+                    imagePath = if (img.isEmpty()) null else img
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    // ---------- call history ----------
+
+    private fun recordCall() {
+        val start = _callStart.value
+        val seconds = if (callAnswered && start > 0L) (System.currentTimeMillis() - start) / 1000 else 0L
+        val rec = CallRecord(
+            callPeerName, callOutgoing, callAnswered,
+            if (start > 0L) start else System.currentTimeMillis(), seconds
+        )
+        _calls.update { (listOf(rec) + it).take(100) }
+        saveCalls(_calls.value)
+    }
+
+    private fun saveCalls(list: List<CallRecord>) {
+        val arr = JSONArray()
+        list.forEach { c ->
+            arr.put(
+                JSONObject()
+                    .put("n", c.peerName)
+                    .put("o", c.outgoing)
+                    .put("a", c.answered)
+                    .put("t", c.time)
+                    .put("s", c.seconds)
+            )
+        }
+        prefs.edit().putString("calls", arr.toString()).apply()
+    }
+
+    private fun loadCalls(): List<CallRecord> {
+        return try {
+            val arr = JSONArray(prefs.getString("calls", "[]"))
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                CallRecord(o.getString("n"), o.getBoolean("o"), o.getBoolean("a"), o.getLong("t"), o.getLong("s"))
             }
         } catch (e: Exception) {
             emptyList()
@@ -213,6 +356,9 @@ class NearbyManager(
     fun startCall(peerId: String) {
         if (_callState.value != CallState.IDLE) return
         _callPeerId.value = peerId
+        callOutgoing = true
+        callAnswered = false
+        callPeerName = peerMap[peerId]?.name ?: "Unknown"
         _callState.value = CallState.OUTGOING
         send(peerId, "CR")
     }
@@ -222,6 +368,7 @@ class NearbyManager(
         if (_callState.value != CallState.INCOMING) return
         stopRinging()
         send(p, "CA")
+        callAnswered = true
         _callStart.value = System.currentTimeMillis()
         _callState.value = CallState.ACTIVE
         startAudio(p)
@@ -311,33 +458,54 @@ class NearbyManager(
                         startPlayback(input)
                     }
                 }
+                Payload.Type.FILE -> incomingFiles[payload.id] = id to payload
                 else -> Unit
             }
         }
 
-        override fun onPayloadTransferUpdate(id: String, update: PayloadTransferUpdate) = Unit
+        override fun onPayloadTransferUpdate(id: String, update: PayloadTransferUpdate) {
+            when (update.status) {
+                PayloadTransferUpdate.Status.SUCCESS -> {
+                    val entry = incomingFiles.remove(update.payloadId) ?: return
+                    saveReceivedImage(entry.first, entry.second)
+                }
+                PayloadTransferUpdate.Status.FAILURE,
+                PayloadTransferUpdate.Status.CANCELED -> incomingFiles.remove(update.payloadId)
+                else -> Unit
+            }
+        }
     }
 
     private fun onControl(from: String, s: String) {
         when {
             s.startsWith("M|") -> {
-                val uid = peerMap[from]?.uid ?: from
-                addMessage(ChatMessage(uid, s.substring(2), mine = false))
-                if (activeChatUid != uid) {
-                    _unread.update { it + (uid to ((it[uid] ?: 0) + 1)) }
-                    beep()
+                val parts = s.split("|", limit = 3)
+                if (parts.size == 3) {
+                    val uid = peerMap[from]?.uid ?: from
+                    addMessage(ChatMessage(uid, parts[2], mine = false, id = parts[1]))
+                    send(from, "A|${parts[1]}")
+                    if (activeChatUid != uid) {
+                        _unread.update { it + (uid to ((it[uid] ?: 0) + 1)) }
+                        beep()
+                    }
                 }
             }
+
+            s.startsWith("A|") -> markDelivered(s.substring(2))
 
             s == "CR" ->
                 if (_callState.value == CallState.IDLE) {
                     _callPeerId.value = from
+                    callOutgoing = false
+                    callAnswered = false
+                    callPeerName = peerMap[from]?.name ?: "Unknown"
                     _callState.value = CallState.INCOMING
                     startRinging()
                 } else send(from, "CX")
 
             s == "CA" ->
                 if (_callState.value == CallState.OUTGOING && _callPeerId.value == from) {
+                    callAnswered = true
                     _callStart.value = System.currentTimeMillis()
                     _callState.value = CallState.ACTIVE
                     startAudio(from)
@@ -449,6 +617,7 @@ class NearbyManager(
     }
 
     private fun teardownCall() {
+        if (_callState.value != CallState.IDLE) recordCall()
         stopRinging()
         audioRunning = false
         _callState.value = CallState.IDLE
