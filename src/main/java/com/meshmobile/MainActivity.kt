@@ -114,17 +114,15 @@ fun FreeCallOfflineApp(context: Context) {
         onDispose { nearby?.stop() }
     }
 
-    MaterialTheme {
+    FreeCallTheme {
 
         Scaffold(
 
+            containerColor = androidx.compose.ui.graphics.Color.Transparent,
+
             topBar = {
 
-                TopAppBar(
-                    title = {
-                        Text("FreeCall Offline")
-                    }
-                )
+                BrandHeader()
             }
 
         ) { padding ->
@@ -355,51 +353,62 @@ private fun HomeScreen(
 
 ) {
 
-    Row(
+    Surface(
 
-        modifier
-            .fillMaxWidth()
-            .padding(16.dp),
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp),
 
-        verticalAlignment =
-            Alignment.CenterVertically
+        color = MaterialTheme.colorScheme.surfaceVariant,
+
+        modifier =
+            modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp)
     ) {
 
-        ProfileAvatar(
-            photo = profile.photo,
-            size = 76
-        )
+        Row(
 
-        Spacer(
-            Modifier.width(14.dp)
-        )
+            Modifier.padding(12.dp),
 
-        Column(
-            Modifier.weight(1f)
+            verticalAlignment =
+                Alignment.CenterVertically
         ) {
 
-            Text(
-                profile.name,
-                style =
-                    MaterialTheme
-                        .typography
-                        .titleLarge
+            ProfileAvatar(
+                photo = profile.photo,
+                size = 52
             )
 
-            Text(
-                "@${profile.username}"
+            Spacer(
+                Modifier.width(12.dp)
             )
 
-            Text(
-                profile.phone
-            )
-        }
+            Column(
+                Modifier.weight(1f)
+            ) {
 
-        TextButton(
-            onClick = onChangePhoto
-        ) {
+                Text(
+                    profile.name,
+                    style =
+                        MaterialTheme
+                            .typography
+                            .titleMedium
+                )
 
-            Text("Photo")
+                Text(
+                    "@${profile.username}  •  ${profile.phone}",
+                    style =
+                        MaterialTheme
+                            .typography
+                            .bodySmall
+                )
+            }
+
+            TextButton(
+                onClick = onChangePhoto
+            ) {
+
+                Text("Photo")
+            }
         }
     }
 }

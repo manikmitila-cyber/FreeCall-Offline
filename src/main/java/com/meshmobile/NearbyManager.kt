@@ -106,6 +106,15 @@ class NearbyManager(
     private val _calls = MutableStateFlow(loadCalls())
     val calls: StateFlow<List<CallRecord>> = _calls
 
+    private val _typing = MutableStateFlow<Set<String>>(emptySet())
+    /** Uids of peers who are typing to us right now. */
+    val typing: StateFlow<Set<String>> = _typing
+    private val typingAt = ConcurrentHashMap<String, Long>()
+    private var lastTypingSent = 0L
+
+    private val _sound = MutableStateFlow(prefs.getBoolean("sound", true))
+    val sound: StateFlow<Boolean> = _sound
+
     private val incomingFiles = ConcurrentHashMap<Long, Pair<String, Payload>>()
     private var callOutgoing = false
     private var callAnswered = false
@@ -214,6 +223,38 @@ class NearbyManager(
                 Log.w(TAG, "send image failed", e)
             }
         }
+    }
+
+    /** Tell the peer we are typing (sent at most every 2 seconds). */
+    fun sendTyping(peerId: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastTypingSent < 2000) return
+        lastTypingSent = now
+        send(peerId, "T")
+    }
+
+    private fun onTyping(uid: String) {
+        typingAt[uid] = System.currentTimeMillis()
+        _typing.update { it + uid }
+        handler.postDelayed({
+            val last = typingAt[uid] ?: 0L
+            if (System.currentTimeMillis() - last >= 2900) _typing.update { it - uid }
+        }, 3000)
+    }
+
+    fun setSound(on: Boolean) {
+        _sound.value = on
+        prefs.edit().putBoolean("sound", on).apply()
+    }
+
+    /** Delete every chat, photo and call record from this phone. */
+    fun clearAll() {
+        _messages.value.forEach { m -> m.imagePath?.let { runCatching { File(it).delete() } } }
+        _messages.value = emptyList()
+        saveMessages(emptyList())
+        _calls.value = emptyList()
+        saveCalls(emptyList())
+        _unread.value = emptyMap()
     }
 
     fun clearChat(uid: String) {
@@ -482,6 +523,7 @@ class NearbyManager(
                 val parts = s.split("|", limit = 3)
                 if (parts.size == 3) {
                     val uid = peerMap[from]?.uid ?: from
+                    _typing.update { it - uid }
                     addMessage(ChatMessage(uid, parts[2], mine = false, id = parts[1]))
                     send(from, "A|${parts[1]}")
                     if (activeChatUid != uid) {
@@ -492,6 +534,8 @@ class NearbyManager(
             }
 
             s.startsWith("A|") -> markDelivered(s.substring(2))
+
+            s == "T" -> peerMap[from]?.uid?.let { onTyping(it) }
 
             s == "CR" ->
                 if (_callState.value == CallState.IDLE) {
@@ -533,6 +577,7 @@ class NearbyManager(
     }
 
     private fun beep() {
+        if (!_sound.value) return
         runCatching {
             val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
             RingtoneManager.getRingtone(app, uri)?.play()
